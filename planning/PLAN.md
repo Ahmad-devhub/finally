@@ -454,3 +454,51 @@ The container is designed to deploy to AWS App Runner, Render, or any container 
 - Portfolio visualization: heatmap renders with correct colors, P&L chart has data points
 - AI chat (mocked): send a message, receive a response, trade execution appears inline
 - SSE resilience: disconnect and verify reconnection
+
+---
+
+## 13. Documentation Review — Questions, Clarifications & Simplifications
+
+_Added 2026-11-04 by doc review. The market data subsystem (§6) is already built (see `MARKET_DATA_SUMMARY.md`); items below focus on the as-yet-unbuilt portfolio, chat, API, and frontend layers and on seams between them._
+
+### A. Gaps that will block an agent (recommend resolving before build)
+
+1. **How does portfolio total value update "live"?** The header shows a live-updating total value, but SSE (§6) streams *prices only*. There is no portfolio/value stream and no event pushed on trade. Decision needed: does the frontend recompute `total_value = cash + Σ(qty × live_price)` locally from the price stream + the `/api/portfolio` snapshot (recommended — zero new backend work), or does the backend expose a second SSE channel? If local, say so explicitly so the frontend agent doesn't wait for a stream that never comes.
+
+2. **Positions you hold but aren't watching.** SSE pushes "all tickers known to the system." If a user removes a ticker from the watchlist while still holding a position in it (or the AI does), does its price stop updating? That would freeze/mis-value the position and break P&L. Recommend: the set of streamed tickers = `watchlist ∪ tickers-with-open-positions`, and `DELETE /api/watchlist/{ticker}` is allowed even while a position exists. Please state the rule.
+
+3. **Adding an unknown ticker to the simulator.** `seed_prices.py` only defines seed prices and GBM params for the 10 default tickers. When a user or the AI adds e.g. `PYPL` (the schema's own example), what price does the simulator use? Options: assign a default seed + default drift/vol on the fly, or reject tickers not in a known universe. This is now a concrete behavior the watchlist/chat code depends on — the current market-data module should be checked for whether `add_ticker` already handles unknown symbols.
+
+4. **No endpoint to load chat history.** `chat_messages` is persisted, but there is no `GET /api/chat` (or `/api/chat/history`). On page reload the conversation can't be restored. Either add a GET endpoint or document that chat history is intentionally session-only in the UI (even though it's stored).
+
+5. **Definition of "daily change %".** The watchlist and positions table show a change %, but the system has no concept of "previous close" — the simulator starts from a seed price at process start, and `PriceUpdate.previous_price` is only the *last tick*. Define the baseline: session-open price (first price seen since server/process start) is the simplest and should be stated as the reference for the displayed %.
+
+### B. Clarifications worth a sentence each
+
+6. **Startup vs. first-request init.** §7 says the DB initializes "on startup (or first request)," but the market-data background task *must* run regardless of traffic. Recommend committing to a FastAPI `lifespan` handler that (a) inits/seeds the DB, (b) starts the market source, (c) starts the 30s snapshot task — and drop the "first request" wording to avoid two code paths.
+
+7. **SQLite concurrency.** Request handlers (trades) and background tasks (snapshots every 30s, snapshot-on-trade) write concurrently. Specify WAL mode and/or a single serialized connection so writers don't hit `database is locked`.
+
+8. **Can you trade a ticker you aren't watching?** `POST /api/portfolio/trade` takes only `{ticker, quantity, side}`. Clarify whether a buy auto-adds to the watchlist (and thus the price stream) — otherwise a freshly-bought position may have no live price (ties into #2/#3).
+
+9. **Sell-to-zero behavior and realized P&L.** State whether a position row is deleted when quantity reaches 0, and confirm that realized P&L is intentionally *not* tracked (there's no `realized_pnl` field anywhere; only unrealized P&L is surfaced). If realized P&L should appear in chat/positions, the schema needs a field or it must be derived from the `trades` log.
+
+10. **Trade input validation rules.** Define rejections explicitly: `quantity <= 0`, selling more shares than held, buying with insufficient cash, and the case where the price cache has no price yet for the ticker (e.g., just added). These are referenced piecemeal in §12 but never enumerated as rules.
+
+11. **Local dev workflow and the "no CORS" claim.** "Same origin, no CORS" is true only for the production static-export path. In dev the Next.js dev server (:3000) and FastAPI (:8000) are separate origins. Document the intended dev setup (Next.js `rewrites` proxying `/api/*` → `:8000`, or running against the built export) so the frontend agent doesn't add CORS middleware that then ships to prod.
+
+12. **LLM robustness.** The happy-path flow (§9 step 5) says "parses the structured JSON" but only the *test* section mentions malformed responses. State the runtime behavior on invalid/again-unparseable output: retry once, or return a graceful "I couldn't process that" message. Also cap "recent conversation history" to a concrete number of messages (e.g., last 20) to bound the prompt.
+
+13. **`.env` vs. injected env vars.** §5 says the backend "reads `.env` from the project root," but in the container env vars are injected via `--env-file` (not a file the app parses). Recommend: backend reads `os.environ` (with `python-dotenv` only as a dev convenience). Minor but avoids a container-vs-local discrepancy.
+
+### C. Opportunities to simplify
+
+14. **Drop the price-history question by making it explicit.** Neither prices nor sparkline data are persisted (only `portfolio_snapshots` is a time series). State plainly that the main chart and sparklines are *session-accumulated from SSE and reset on reload* — this is simpler than it looks and prevents an agent from building a price-history table/endpoint that isn't in the schema.
+
+15. **One shared trade-execution function.** Manual trades (`/api/portfolio/trade`) and AI trades (§9 auto-exec) must share a single execution + validation path. Worth stating as a requirement so two divergent implementations don't appear; it also makes the snapshot-on-trade and error-reporting behavior uniform.
+
+16. **Consider deferring the heatmap/treemap.** The treemap is the one visualization that pulls in a heavier/less-common charting dependency. The positions table + P&L chart already convey weight and P&L. If build time is tight, the heatmap is the most cuttable "wow" element without losing core function — flag it as a stretch within §10 rather than a must-have.
+
+17. **Trim unused schema fields.** `users_profile.created_at` is never read anywhere in the spec. Harmless, but if minimalism is a goal it can go.
+
+18. **Missing but cheap: a reset/trade-history surface.** There's no way to reset cash/positions without deleting the Docker volume, and the persisted `trades` log has no GET endpoint. Both are optional, but a tiny `POST /api/portfolio/reset` is a big demo-quality win for re-running the pitch, and a `GET /api/portfolio/trades` is nearly free given the table exists. Decide in or out explicitly.
